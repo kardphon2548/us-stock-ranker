@@ -1,0 +1,88 @@
+name: Update stock ranking and publish
+on:
+  workflow_dispatch:
+    inputs:
+      refresh_data:
+        description: Fetch new data before publishing
+        type: boolean
+        default: true
+        required: true
+  schedule:
+    - cron: '40 22 * * 1-5'
+permissions:
+  contents: read
+concurrency:
+  group: stock-ranking-pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Unpack application
+        run: python -m zipfile -e source.zip project
+      - name: Test scoring and collection rules
+        working-directory: project
+        run: python -m unittest discover -s tests -v
+      - name: Require SEC contact header
+        if: github.event_name == 'schedule' || inputs.refresh_data
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          if [ -z "$SEC_USER_AGENT" ]; then
+            echo '::error::Add repository secret SEC_USER_AGENT before refreshing.'
+            exit 1
+          fi
+      - name: Collect a complete new snapshot
+        if: github.event_name == 'schedule' || inputs.refresh_data
+        working-directory: project
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          PYTHONUNBUFFERED: '1'
+        run: python scripts/collect.py --strict
+      - name: Check publish files
+        run: |
+          test -f project/dist/index.html
+          test -f project/dist/data/latest.json
+          python -m json.tool project/dist/data/latest.json > /dev/null
+      - name: Describe this deployment
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          automatic = bool(os.environ.get("SEC_USER_AGENT"))
+          message = "ตั้งเวลาอัปเดตรายวันผ่าน GitHub Actions ประมาณ 05:40 น. อังคาร–เสาร์ (ไทย) งานอาจล่าช้าหรือหยุดได้" if automatic else "เว็บเปิดใช้งานแล้ว รอเพิ่ม SEC_USER_AGENT เพื่อเปิดอัปเดตรายวัน ขณะนี้ใช้ snapshot ที่เผยแพร่ไว้"
+          data = {"mode": "github-pages", "automatic_updates": automatic, "message": message}
+          Path("project/dist/deployment.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+          PY
+      - name: Package website
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: project/dist
+          retention-days: 1
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Read Pages configuration
+        uses: actions/configure-pages@v6
+      - name: Publish website
+        id: deployment
+        uses: actions/deploy-pages@v5
